@@ -31,7 +31,7 @@ public class IotMonitoringApplication {
 
 		@PostConstruct
 		public void initialize() {
-			// Verifica se o Firebase já foi inicializado
+			// Verifica se o Firebase já foi inicializado 
 			if (!FirebaseApp.getApps().isEmpty()) {
 				logger.info("[WIND MONITOR] Firebase já inicializado");
 				return;
