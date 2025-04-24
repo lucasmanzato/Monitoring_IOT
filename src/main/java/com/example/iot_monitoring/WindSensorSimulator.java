@@ -1,111 +1,220 @@
 package com.example.iot_monitoring;
 
-import com.google.firebase.database.*;
+import com.google.auth.oauth2.GoogleCredentials;
+import com.google.firebase.FirebaseApp;
+import com.google.firebase.FirebaseOptions;
+import com.google.firebase.database.DatabaseReference;
+import com.google.firebase.database.FirebaseDatabase;
 import org.eclipse.paho.client.mqttv3.*;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.web.bind.annotation.*;
+import org.springframework.core.io.ClassPathResource;
+import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.stereotype.Service;
 
 import javax.annotation.PostConstruct;
 import javax.annotation.PreDestroy;
+import java.io.IOException;
+import java.io.InputStream;
 import java.util.Random;
-import java.util.concurrent.*;
+import java.util.UUID;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 @Service
-public class WindSensorSimulator {
+public class WindSensorSimulator implements MqttCallbackExtended {
     private static final Logger logger = LoggerFactory.getLogger(WindSensorSimulator.class);
 
-    // Configurações MQTT
     @Value("${mqtt.broker.url:tcp://localhost:1883}")
     private String brokerUrl;
 
-    @Value("${mqtt.client.prefix:wind-sensor-publisher}")
+    @Value("${mqtt.client.prefix:wind-sensor}")
     private String clientIdPrefix;
 
     @Value("${wind.simulation.interval:5}")
     private int simulationInterval;
 
-    // Firebase
+    @Value("${wind.simulation.min-speed:10}")
+    private double minSpeed;
+
+    @Value("${wind.simulation.max-speed:50}")
+    private double maxSpeed;
+
+    @Value("${firebase.database.url}")
+    private String firebaseDatabaseUrl;
+
+    @Value("${firebase.config.path}")
+    private String firebaseConfigPath;
+
     private DatabaseReference firebaseRef;
-    private MqttClient mqttClient;
+    private MqttAsyncClient mqttClient;
     private final Random random = new Random();
-    private final MqttConnectOptions connectOptions;
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
 
-    public WindSensorSimulator() {
-        this.connectOptions = new MqttConnectOptions();
-        this.connectOptions.setAutomaticReconnect(true);
-        this.connectOptions.setConnectionTimeout(30);
-        this.connectOptions.setKeepAliveInterval(60);
+    @Autowired
+    private SimpMessagingTemplate messagingTemplate;
 
-        // Inicializa Firebase
-        this.firebaseRef = FirebaseDatabase.getInstance().getReference("wind_measurements");
-    }
+    @Autowired
+    private MqttConnectOptions mqttConnectOptions;
 
     @PostConstruct
     public void init() {
         try {
-            String clientId = clientIdPrefix + "-" + System.currentTimeMillis();
-            this.mqttClient = new MqttClient(brokerUrl, clientId);
-            this.mqttClient.connect(connectOptions);
-            logger.info("Conectado ao broker MQTT em {}", brokerUrl);
+            // Initialize Firebase first
+            initializeFirebase();
 
+            // Configure MQTT client
+            if (mqttConnectOptions.getServerURIs() == null || mqttConnectOptions.getServerURIs().length == 0) {
+                mqttConnectOptions.setServerURIs(new String[]{brokerUrl});
+            }
+
+            this.mqttClient = new MqttAsyncClient(
+                    brokerUrl,
+                    clientIdPrefix + "-" + UUID.randomUUID()
+            );
+
+            this.mqttClient.setCallback(this);
+            this.mqttClient.connect(mqttConnectOptions).waitForCompletion();
+
+            logger.info("Connected to MQTT broker: {}", brokerUrl);
             startAutomaticPublishing();
+
         } catch (MqttException e) {
-            logger.error("Falha na conexão MQTT", e);
+            logger.error("MQTT connection failed", e);
+            scheduleReconnect();
+        } catch (Exception e) {
+            logger.error("Service initialization error", e);
         }
     }
 
-    private void startAutomaticPublishing() {
-        scheduler.scheduleAtFixedRate(() -> {
-            try {
-                publishWindData();
-            } catch (Exception e) {
-                logger.error("Erro na publicação automática", e);
+    private void initializeFirebase() {
+        try {
+            logger.info("Loading Firebase configuration from: {}", firebaseConfigPath);
+
+            // Load configuration file from classpath
+            InputStream serviceAccount = getClass().getClassLoader().getResourceAsStream(firebaseConfigPath);
+
+            if (serviceAccount == null) {
+                throw new IOException("Firebase config file not found in classpath: " + firebaseConfigPath);
             }
-        }, 0, simulationInterval, TimeUnit.SECONDS);
+
+            FirebaseOptions options = new FirebaseOptions.Builder()
+                    .setCredentials(GoogleCredentials.fromStream(serviceAccount))
+                    .setDatabaseUrl(firebaseDatabaseUrl)
+                    .build();
+
+            if (FirebaseApp.getApps().isEmpty()) {
+                FirebaseApp.initializeApp(options);
+                logger.info("Firebase initialized successfully");
+            }
+
+            this.firebaseRef = FirebaseDatabase.getInstance().getReference("wind_measurements");
+            logger.info("Firebase reference configured");
+
+        } catch (IOException e) {
+            logger.error("ERROR: Firebase configuration file not found", e);
+            logger.error("Please verify:");
+            logger.error("1. File '{}' exists in src/main/resources/", firebaseConfigPath);
+            logger.error("2. Filename is correct (including case sensitivity)");
+            logger.error("3. Project was rebuilt after adding the file");
+            throw new RuntimeException("Critical failure: Firebase config file not found", e);
+        } catch (Exception e) {
+            logger.error("Firebase initialization error", e);
+            throw new RuntimeException("Firebase configuration failed", e);
+        }
+    }
+
+    private void scheduleReconnect() {
+        scheduler.schedule(() -> {
+            logger.info("Attempting reconnection...");
+            init();
+        }, 1, TimeUnit.MINUTES);
+    }
+
+    private void startAutomaticPublishing() {
+        scheduler.scheduleAtFixedRate(this::publishWindData, 0, simulationInterval, TimeUnit.SECONDS);
     }
 
     public void publishWindData() {
         try {
-            // Gera dados simulados
-            double windSpeed = 10 + (random.nextDouble() * 40); // 10-50 km/h
-            double windDirection = random.nextDouble() * 360; // 0-359°
+            if (firebaseRef == null) {
+                logger.warn("Firebase reference not initialized, attempting reinitialization...");
+                initializeFirebase();
+                if (firebaseRef == null) {
+                    throw new IllegalStateException("Failed to initialize Firebase reference");
+                }
+            }
 
-            // Publica via MQTT
-            publishMqttData(windSpeed, windDirection);
+            WindData data = new WindData(
+                    minSpeed + (random.nextDouble() * (maxSpeed - minSpeed)),
+                    random.nextDouble() * 360
+            );
 
-            // Armazena no Firebase
-            saveToFirebase(windSpeed, windDirection);
+            publishMqttData(data);
+            saveToFirebase(data);
+            sendWebSocketUpdate(data);
+
+            logger.info("Data published - Speed: {:.2f} km/h, Direction: {:.1f}°",
+                    data.getSpeed(), data.getDirection());
 
         } catch (Exception e) {
-            logger.error("Falha ao publicar dados", e);
+            logger.error("Failed to publish data", e);
         }
     }
 
-    private void publishMqttData(double speed, double direction) throws MqttException {
-        MqttMessage speedMessage = new MqttMessage(String.valueOf(speed).getBytes());
-        mqttClient.publish("wind/speed", speedMessage);
+    private void publishMqttData(WindData data) throws MqttException {
+        String payload = String.format("{\"speed\":%.2f,\"direction\":%.2f,\"timestamp\":%d}",
+                data.getSpeed(), data.getDirection(), data.getTimestamp());
 
-        MqttMessage directionMessage = new MqttMessage(String.valueOf(direction).getBytes());
-        mqttClient.publish("wind/direction", directionMessage);
+        MqttMessage message = new MqttMessage(payload.getBytes());
+        message.setQos(1);
+        message.setRetained(true);
 
-        logger.info("Dados MQTT publicados - Velocidade: {:.2f} km/h, Direção: {:.1f}°", speed, direction);
+        mqttClient.publish("wind/data", message);
     }
 
-    private void saveToFirebase(double speed, double direction) {
-        WindData data = new WindData(speed, direction);
-
-        firebaseRef.push().setValue(data, (error, ref) -> {
-            if (error != null) {
-                logger.error("Erro ao salvar no Firebase: {}", error.getMessage());
-            } else {
-                logger.info("Dados salvos no Firebase: {}", data);
-            }
-        });
+    private void sendWebSocketUpdate(WindData data) {
+        try {
+            messagingTemplate.convertAndSend("/topic/wind_updates", data);
+        } catch (Exception e) {
+            logger.error("Failed to send WebSocket update", e);
+        }
     }
+
+    private void saveToFirebase(WindData data) {
+        try {
+            firebaseRef.push().setValue(data, (error, ref) -> {
+                if (error != null) {
+                    logger.error("Firebase save error: {}", error.getMessage());
+                } else {
+                    logger.debug("Data saved to Firebase with key: {}", ref.getKey());
+                }
+            });
+        } catch (Exception e) {
+            logger.error("Failed to save data to Firebase", e);
+        }
+    }
+
+    @Override
+    public void connectComplete(boolean reconnect, String serverURI) {
+        logger.info(reconnect ? "Reconnected to broker" : "Connected to broker");
+    }
+
+    @Override
+    public void connectionLost(Throwable cause) {
+        logger.warn("Connection lost: {}", cause.getMessage());
+    }
+
+    @Override
+    public void messageArrived(String topic, MqttMessage message) {
+        logger.debug("Message received: {} - {}", topic, new String(message.getPayload()));
+    }
+
+    @Override
+    public void deliveryComplete(IMqttDeliveryToken token) {}
 
     @PreDestroy
     public void cleanup() {
@@ -115,28 +224,7 @@ public class WindSensorSimulator {
             }
             scheduler.shutdown();
         } catch (MqttException e) {
-            logger.error("Erro ao encerrar", e);
+            logger.error("Error during cleanup", e);
         }
-    }
-}
-
-@RestController
-@RequestMapping("/api/wind-sensor")
-class WindSensorController {
-    private final WindSensorSimulator sensorSimulator;
-
-    public WindSensorController(WindSensorSimulator sensorSimulator) {
-        this.sensorSimulator = sensorSimulator;
-    }
-
-    @GetMapping("/publish")
-    public String triggerWindMeasurement() {
-        sensorSimulator.publishWindData();
-        return "Dados de vento publicados com sucesso";
-    }
-
-    @GetMapping("/status")
-    public String getStatus() {
-        return "Simulador de sensor de vento operacional";
     }
 }
